@@ -6,6 +6,7 @@ import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
+import ru.quipy.common.utils.OngoingWindow
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
@@ -63,7 +64,8 @@ class PaymentAccountsConfig {
                     SlidingWindowRateLimiter(
                         it.rateLimitPerSec.toLong(),
                         Duration.ofSeconds(1)
-                    )
+                    ),
+                    OngoingWindow(it.parallelRequests)
                 )
             }
     }
