@@ -51,35 +51,50 @@ class PaymentExternalSystemAdapterImpl(
                 post(emptyBody)
             }.build()
 
-            val checkTimeout: (String) -> Boolean = { where ->
-                if (now() >= timeout) {
-                    val submittedAt = now()
-                    paymentESService.update(paymentId) {
-                        it.logSubmission(false, transactionId, submittedAt, Duration.ofMillis(submittedAt - paymentStartedAt))
-                    }
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = "Timeout reached: $where")
-                    }
-                    false
-                } else {
-                    true
+            if (now() >= timeout) {
+                paymentESService.update(paymentId) {
+                    it.logSubmission(false, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
                 }
+                paymentESService.update(paymentId) {
+                    it.logProcessing(false, now(), transactionId, reason = "There is no time for payment")
+                }
+                return
             }
 
-            while (!ongoingWindow.tryAcquire(Duration.ofMillis(10))) {
-                if (!checkTimeout("Too Many Requests: parallel limit exceeded"))
-                    return
+            if (!ongoingWindow.tryAcquire(Duration.ofMillis(timeout - now()))) {
+                paymentESService.update(paymentId) {
+                    it.logSubmission(false, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+                }
+                paymentESService.update(paymentId) {
+                    it.logProcessing(false, now(), transactionId, reason = "There is no time for payment, could not acquire in flight limiter")
+                }
+                return
             }
 
             try {
                 while (!rateLimiter.tick()) {
-                    if (!checkTimeout("Too Many Requests: rate limit exceeded"))
-                        return
-                    Thread.sleep(10)
+                    if (now() < timeout) {
+                        Thread.sleep(minOf(10L, timeout - now()))
+                        continue
+                    }
+                    paymentESService.update(paymentId) {
+                        it.logSubmission(false, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+                    }
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = "There is no time for payment, could not acquire in rate limiter")
+                    }
+                    return
                 }
 
-                if (!checkTimeout("There is no time for payment"))
+                if (now() >= timeout) {
+                    paymentESService.update(paymentId) {
+                        it.logSubmission(false, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+                    }
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = "There is no time for payment")
+                    }
                     return
+                }
 
                 // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
                 // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
