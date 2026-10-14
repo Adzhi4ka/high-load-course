@@ -12,6 +12,8 @@ class OngoingWindow(
 
     fun acquire() = window.acquire()
 
+    fun tryAcquire() = window.tryAcquire()
+
     fun tryAcquire(timeout: Duration) = window.tryAcquire(timeout.toNanos(), TimeUnit.NANOSECONDS)
 
     fun release() = window.release()

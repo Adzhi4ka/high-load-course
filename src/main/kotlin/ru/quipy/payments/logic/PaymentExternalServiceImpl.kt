@@ -40,6 +40,12 @@ class PaymentExternalSystemAdapterImpl(
 
     private val client = OkHttpClient.Builder().retryOnConnectionFailure(false).readTimeout(Duration.ZERO).build()
 
+    override fun tryReserve(deadline: Long): Boolean {
+        return isEnabled() && now() < deadline - requestAverageProcessingTime.toMillis() && ongoingWindow.tryAcquire()
+    }
+
+    override fun release() = ongoingWindow.release()
+
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
@@ -61,67 +67,53 @@ class PaymentExternalSystemAdapterImpl(
                 return
             }
 
-            if (!ongoingWindow.tryAcquire(Duration.ofMillis(timeout - now()))) {
+            while (!rateLimiter.tick()) {
+                if (now() < timeout) {
+                    Thread.sleep(minOf(10L, timeout - now()))
+                    continue
+                }
                 paymentESService.update(paymentId) {
                     it.logSubmission(false, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
                 }
                 paymentESService.update(paymentId) {
-                    it.logProcessing(false, now(), transactionId, reason = "There is no time for payment, could not acquire in flight limiter")
+                    it.logProcessing(false, now(), transactionId, reason = "There is no time for payment, could not acquire in rate limiter")
                 }
                 return
             }
 
-            try {
-                while (!rateLimiter.tick()) {
-                    if (now() < timeout) {
-                        Thread.sleep(minOf(10L, timeout - now()))
-                        continue
-                    }
-                    paymentESService.update(paymentId) {
-                        it.logSubmission(false, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
-                    }
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = "There is no time for payment, could not acquire in rate limiter")
-                    }
-                    return
-                }
-
-                if (now() >= timeout) {
-                    paymentESService.update(paymentId) {
-                        it.logSubmission(false, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
-                    }
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = "There is no time for payment")
-                    }
-                    return
-                }
-
-                // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
-                // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
+            if (now() >= timeout) {
                 paymentESService.update(paymentId) {
-                    it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+                    it.logSubmission(false, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+                }
+                paymentESService.update(paymentId) {
+                    it.logProcessing(false, now(), transactionId, reason = "There is no time for payment")
+                }
+                return
+            }
+
+            // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
+            // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
+            paymentESService.update(paymentId) {
+                it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+            }
+
+            logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
+
+            client.newCall(request).execute().use { response ->
+                val body = try {
+                    mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
+                } catch (e: Exception) {
+                    logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
+                    ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
                 }
 
-                logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
+                logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
 
-                client.newCall(request).execute().use { response ->
-                    val body = try {
-                        mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
-                    } catch (e: Exception) {
-                        logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
-                        ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
-                    }
-
-                    logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
-
-                    // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
-                    // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(body.result, now(), transactionId, reason = body.message)
-                    }
+                // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
+                // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
+                paymentESService.update(paymentId) {
+                    it.logProcessing(body.result, now(), transactionId, reason = body.message)
                 }
-            } finally {
-                ongoingWindow.release()
             }
         } catch (e: Exception) {
             when (e) {
