@@ -4,6 +4,8 @@ import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.stereotype.Service
+import org.springframework.http.HttpStatus
+import org.springframework.web.server.ResponseStatusException
 import ru.quipy.common.utils.CallerBlockingRejectedExecutionHandler
 import ru.quipy.common.utils.NamedThreadFactory
 import ru.quipy.core.EventSourcingService
@@ -38,17 +40,29 @@ class OrderPayer {
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
         val createdAt = System.currentTimeMillis()
-        paymentExecutor.submit {
-            val createdEvent = paymentESService.create {
-                it.create(
-                    paymentId,
-                    orderId,
-                    amount
-                )
-            }
-            logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
+        val account = paymentService.tryReserveAccount(deadline)
+            ?: throw ResponseStatusException(HttpStatus.TOO_MANY_REQUESTS, "No payment account resource available")
 
-            paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
+        try {
+            paymentExecutor.submit {
+                try {
+                    val createdEvent = paymentESService.create {
+                        it.create(
+                            paymentId,
+                            orderId,
+                            amount
+                        )
+                    }
+                    logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
+
+                    paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline, account)
+                } finally {
+                    account.release()
+                }
+            }
+        } catch (e: Exception) {
+            account.release()
+            throw e
         }
         return createdAt
     }
