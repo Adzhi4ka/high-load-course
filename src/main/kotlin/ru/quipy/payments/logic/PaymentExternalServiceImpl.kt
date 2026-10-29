@@ -141,6 +141,8 @@ class PaymentExternalSystemAdapterImpl(
 
     override fun name() = properties.accountName
 
+    override fun maxParallelRequests() = properties.parallelRequests
+
 }
 
 public fun now() = System.currentTimeMillis()

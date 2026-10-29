@@ -11,12 +11,15 @@ import ru.quipy.common.utils.NamedThreadFactory
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.util.*
-import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.SynchronousQueue
 
 @Service
-class OrderPayer {
+class OrderPayer(
+    private val paymentAccounts: List<PaymentExternalSystemAdapter>
+) {
 
     companion object {
         val logger: Logger = LoggerFactory.getLogger(OrderPayer::class.java)
@@ -28,14 +31,17 @@ class OrderPayer {
     @Autowired
     private lateinit var paymentService: PaymentService
 
+    private val paymentThreads = paymentAccounts.filter { it.isEnabled() }
+                                                .sumOf { it.maxParallelRequests() }
+
     private val paymentExecutor = ThreadPoolExecutor(
-        16,
-        16,
+        paymentThreads,
+        paymentThreads,
         0L,
         TimeUnit.MILLISECONDS,
-        LinkedBlockingQueue(8_000),
+        SynchronousQueue<Runnable>(),
         NamedThreadFactory("payment-submission-executor"),
-        CallerBlockingRejectedExecutionHandler()
+        ThreadPoolExecutor.AbortPolicy()
     )
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
@@ -60,6 +66,9 @@ class OrderPayer {
                     account.release()
                 }
             }
+        } catch (e: RejectedExecutionException) {
+            account.release()
+            throw ResponseStatusException(HttpStatus.TOO_MANY_REQUESTS, "Payment executor is busy")
         } catch (e: Exception) {
             account.release()
             throw e
