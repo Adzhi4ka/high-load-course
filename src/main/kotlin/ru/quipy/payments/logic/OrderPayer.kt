@@ -4,17 +4,22 @@ import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.stereotype.Service
+import org.springframework.http.HttpStatus
+import org.springframework.web.server.ResponseStatusException
 import ru.quipy.common.utils.CallerBlockingRejectedExecutionHandler
 import ru.quipy.common.utils.NamedThreadFactory
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.util.*
-import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.SynchronousQueue
 
 @Service
-class OrderPayer {
+class OrderPayer(
+    private val paymentAccounts: List<PaymentExternalSystemAdapter>
+) {
 
     companion object {
         val logger: Logger = LoggerFactory.getLogger(OrderPayer::class.java)
@@ -26,29 +31,47 @@ class OrderPayer {
     @Autowired
     private lateinit var paymentService: PaymentService
 
+    private val paymentThreads = paymentAccounts.filter { it.isEnabled() }
+                                                .sumOf { it.maxParallelRequests() }
+
     private val paymentExecutor = ThreadPoolExecutor(
-        16,
-        16,
+        paymentThreads,
+        paymentThreads,
         0L,
         TimeUnit.MILLISECONDS,
-        LinkedBlockingQueue(8_000),
+        SynchronousQueue<Runnable>(),
         NamedThreadFactory("payment-submission-executor"),
-        CallerBlockingRejectedExecutionHandler()
+        ThreadPoolExecutor.AbortPolicy()
     )
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
         val createdAt = System.currentTimeMillis()
-        paymentExecutor.submit {
-            val createdEvent = paymentESService.create {
-                it.create(
-                    paymentId,
-                    orderId,
-                    amount
-                )
-            }
-            logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
+        val account = paymentService.tryReserveAccount(deadline)
+            ?: throw ResponseStatusException(HttpStatus.TOO_MANY_REQUESTS, "No payment account resource available")
 
-            paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
+        try {
+            paymentExecutor.submit {
+                try {
+                    val createdEvent = paymentESService.create {
+                        it.create(
+                            paymentId,
+                            orderId,
+                            amount
+                        )
+                    }
+                    logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
+
+                    paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline, account)
+                } finally {
+                    account.release()
+                }
+            }
+        } catch (e: RejectedExecutionException) {
+            account.release()
+            throw ResponseStatusException(HttpStatus.TOO_MANY_REQUESTS, "Payment executor is busy")
+        } catch (e: Exception) {
+            account.release()
+            throw e
         }
         return createdAt
     }

@@ -21,9 +21,12 @@ class PaymentSystemImpl(
         val logger = LoggerFactory.getLogger(PaymentSystemImpl::class.java)
     }
 
-    override fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
-        for (account in paymentAccounts) {
-            account.performPaymentAsync(paymentId, amount, paymentStartedAt, deadline)
-        }
+    override fun tryReserveAccount(deadline: Long): PaymentExternalSystemAdapter? {
+        val account = paymentAccounts.single()
+        return if (account.tryReserve(deadline)) account else null
+    }
+
+    override fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long, account: PaymentExternalSystemAdapter) {
+        account.performPaymentAsync(paymentId, amount, paymentStartedAt, deadline)
     }
 }
